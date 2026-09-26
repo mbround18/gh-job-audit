@@ -131,7 +131,7 @@ impl Client {
         Ok(token)
     }
 
-    async fn req(
+    pub(crate) async fn req(
         &self,
         m: reqwest::Method,
         path: &str,
@@ -159,7 +159,7 @@ impl Client {
     }
 
     /// GET that maps 404/403/409 (feature off, empty repo, no access) to None.
-    async fn get_opt(&self, path: &str) -> Result<Option<Value>> {
+    pub(crate) async fn get_opt(&self, path: &str) -> Result<Option<Value>> {
         let r = self.req(reqwest::Method::GET, path, None).await?;
         let remaining = r
             .headers()
@@ -177,6 +177,55 @@ impl Client {
             s if (200..300).contains(&s) => Ok(Some(r.json().await?)),
             s => bail!("GET {path} -> {s}"),
         }
+    }
+
+    /// GET returning None for 404/403/409 (feature off, no access), for governance checks.
+    pub async fn json_opt(&self, path: &str) -> Result<Option<Value>> {
+        self.get_opt(path).await
+    }
+
+    /// Rate-gated search API GET (None when unavailable).
+    pub async fn search_json(&self, path: &str) -> Result<Option<Value>> {
+        self.search(path).await
+    }
+
+    /// Bare HTTP status of a GET (for 204/404 style feature toggles).
+    pub async fn status(&self, path: &str) -> Result<u16> {
+        Ok(self
+            .req(reqwest::Method::GET, path, None)
+            .await?
+            .status()
+            .as_u16())
+    }
+
+    /// Follow `page=` pagination (100 per page, at most `max_pages`). `key` names the array inside
+    /// an object response (e.g. "workflows"); None when the endpoint is unavailable.
+    pub async fn paged(
+        &self,
+        path: &str,
+        key: Option<&str>,
+        max_pages: u32,
+    ) -> Result<Option<Vec<Value>>> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        for page in 1..=max_pages {
+            let Some(v) = self
+                .get_opt(&format!("{path}{sep}per_page=100&page={page}"))
+                .await?
+            else {
+                return Ok(if page == 1 { None } else { Some(out) });
+            };
+            let arr = match key {
+                Some(k) => v[k].as_array().cloned().unwrap_or_default(),
+                None => v.as_array().cloned().unwrap_or_default(),
+            };
+            let n = arr.len();
+            out.extend(arr);
+            if n < 100 {
+                break;
+            }
+        }
+        Ok(Some(out))
     }
 
     pub async fn list_repos(&self) -> Result<Vec<Value>> {
@@ -214,7 +263,7 @@ impl Client {
         Ok(out)
     }
 
-    async fn search(&self, path: &str) -> Result<Option<Value>> {
+    pub(crate) async fn search(&self, path: &str) -> Result<Option<Value>> {
         let mut last = self.search_gate.lock().await;
         let wait = std::time::Duration::from_millis(2200).saturating_sub(last.elapsed());
         tokio::time::sleep(wait).await;
@@ -342,7 +391,7 @@ impl Client {
     }
 
     /// Never act outside the configured owner, whatever a token says.
-    fn check_owned(&self, full: &str) -> Result<()> {
+    pub(crate) fn check_owned(&self, full: &str) -> Result<()> {
         match full.split_once('/') {
             Some((o, r))
                 if o.eq_ignore_ascii_case(&self.owner) && !r.is_empty() && !r.contains('/') =>
@@ -379,8 +428,8 @@ impl Client {
         Ok(Some(used))
     }
 
-    /// Fetch the login of the user behind an OAuth user token (for click authorization).
-    pub async fn oauth_login(http: &reqwest::Client, user_token: &str) -> Result<String> {
+    /// Login + immutable numeric id of the user behind an OAuth user token.
+    pub async fn oauth_user(http: &reqwest::Client, user_token: &str) -> Result<(String, i64)> {
         let v: Value = http
             .get(format!("{API}/user"))
             .bearer_auth(user_token)
@@ -390,6 +439,15 @@ impl Client {
             .error_for_status()?
             .json()
             .await?;
-        Ok(v["login"].as_str().context("login")?.to_string())
+        Ok((
+            v["login"].as_str().context("login")?.to_string(),
+            v["id"].as_i64().context("id")?,
+        ))
+    }
+
+    /// Numeric id of a public account (used to pin the owner's identity at startup).
+    pub async fn user_id(&self, login: &str) -> Result<i64> {
+        let v = self.get(&format!("/users/{login}")).await?;
+        v["id"].as_i64().context("user id")
     }
 }

@@ -1,22 +1,27 @@
 //! Email-button backend: GitHub sign-in, single-use tokens, NATS JetStream work queue.
-use crate::{config::Config, db};
+//! All protection lives in `security.rs`; handlers here can assume a verified owner `Session`.
+use crate::{
+    config::Config,
+    db,
+    security::{self, Guard, Session},
+};
 use anyhow::{Result, bail};
 use axum::{
-    Router,
+    Extension, Form, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
+    middleware::from_fn_with_state,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use futures::StreamExt;
 use gh_core::Client;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tower_http::{limit::RequestBodyLimitLayer, services::ServeDir, timeout::TimeoutLayer};
 
-const STREAM: &str = "KNOCK";
+pub const STREAM: &str = "KNOCK";
 const SUBJECT: &str = "knock.actions.requested";
 const RESULT_SUBJECT: &str = "knock.actions.result";
 
@@ -26,6 +31,8 @@ pub struct App {
     pub pool: PgPool,
     pub nats: Option<async_nats::jetstream::Context>,
     pub http: reqwest::Client,
+    pub guard: Arc<Guard>,
+    pub web_dir: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -34,6 +41,8 @@ pub struct ActionRequest {
     pub repo: String,
     pub action: String,
     pub actor: String,
+    #[serde(default)]
+    pub ip: String,
 }
 
 fn esc(s: &str) -> String {
@@ -47,73 +56,49 @@ fn valid_token(t: &str) -> bool {
     t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// ---- sessions: `login.exp.hmac` -------------------------------------------------------------
-
-fn sign(secret: &str, msg: &str) -> String {
-    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    m.update(msg.as_bytes());
-    hex::encode(m.finalize().into_bytes())
-}
-
-fn verify(secret: &str, msg: &str, sig: &str) -> bool {
-    let Ok(sig) = hex::decode(sig) else {
-        return false;
-    };
-    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-    m.update(msg.as_bytes());
-    m.verify_slice(&sig).is_ok()
-}
-
-fn cookie<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    h.get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|c| c.trim().strip_prefix(&format!("{name}=")))
-}
-
-fn session_login(app: &App, h: &HeaderMap) -> Option<String> {
-    let secret = app.cfg.session_secret.as_deref()?;
-    let v = cookie(h, "kk_session")?;
-    let (msg, sig) = v.rsplit_once('.')?;
-    if !verify(secret, msg, sig) {
-        return None;
-    }
-    let (login, exp) = msg.split_once('.')?;
-    (exp.parse::<i64>().ok()? > chrono::Utc::now().timestamp()
-        && login.eq_ignore_ascii_case(&app.cfg.owner))
-    .then(|| login.to_string())
-}
-
-fn set_cookie(app: &App, name: &str, value: &str, max_age: i64) -> HeaderValue {
-    let secure = if app.cfg.base_url.starts_with("https") {
-        "; Secure"
-    } else {
-        ""
-    };
-    HeaderValue::from_str(&format!(
-        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
-    ))
-    .unwrap()
-}
-
 fn page(title: &str, body: &str) -> Html<String> {
+    // No inline styles/scripts: the CSP forbids them. Uses the bundled stylesheet if present.
     Html(format!(
-        "<!doctype html><meta name=viewport content=\"width=device-width\"><title>{t}</title>\
-         <body style=\"font-family:sans-serif;max-width:560px;margin:4rem auto;padding:0 1rem\"><h2>{t}</h2>{body}</body>",
+        "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\">\
+         <title>{t}</title><link rel=stylesheet href=\"/action.css\"></head><body><main><h2>{t}</h2>{body}</main></body></html>",
         t = esc(title)
     ))
 }
 
-// ---- routes ---------------------------------------------------------------------------------
+const ACTION_CSS: &str = "body{font-family:system-ui,sans-serif;background:#0b0d10;color:#e6e8eb;margin:0}\
+main{max-width:34rem;margin:4rem auto;padding:0 1rem}button{padding:.6rem 1.2rem;border:0;border-radius:6px;\
+background:#b91c1c;color:#fff;font-size:1rem;cursor:pointer}b{color:#fff}";
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+    let g = app.guard.clone();
+    // Default-deny: everything under /a/ needs an owner session and (for writes) same-origin.
+    let protected = Router::new()
+        .route("/a/{token}", get(confirm).post(execute))
+        .layer(from_fn_with_state(g.clone(), security::require_session))
+        .layer(from_fn_with_state(g.clone(), security::origin_guard));
+    let public = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/action.css",
+            get(|| async { ([(header::CONTENT_TYPE, "text/css")], ACTION_CSS) }),
+        )
         .route("/login", get(login))
         .route("/callback", get(callback))
-        .route("/a/{token}", get(confirm).post(execute))
+        .fallback_service(
+            ServeDir::new(app.web_dir.clone()).append_index_html_on_directories(true),
+        );
+    public
+        .merge(protected)
         .with_state(app)
+        .layer(axum::middleware::from_fn(security::security_headers))
+        .layer(from_fn_with_state(g.clone(), security::rate_limit))
+        .layer(from_fn_with_state(g, security::host_guard))
+        .layer(RequestBodyLimitLayer::new(8 * 1024))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(20),
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 #[derive(Deserialize)]
@@ -122,30 +107,26 @@ struct LoginQ {
 }
 
 async fn login(State(app): State<Arc<App>>, Query(q): Query<LoginQ>) -> Response {
-    let (Some(cid), Some(_)) = (&app.cfg.oauth_client_id, &app.cfg.session_secret) else {
+    let Some(cid) = &app.cfg.oauth_client_id else {
         return (StatusCode::SERVICE_UNAVAILABLE, "sign-in not configured").into_response();
     };
+    let g = &app.guard;
+    // Only same-site action links are valid post-login destinations (no open redirect).
     let next = q
         .next
         .filter(|n| n.strip_prefix("/a/").is_some_and(valid_token))
         .unwrap_or_else(|| "/".into());
     let state = db::new_token();
     let mut r = Redirect::to(&format!(
-        "https://github.com/login/oauth/authorize?client_id={cid}&redirect_uri={}/callback&state={state}",
+        "https://github.com/login/oauth/authorize?client_id={cid}&redirect_uri={}/callback&state={state}&allow_signup=false",
         app.cfg.base_url
     ))
     .into_response();
-    // state + next travel in a signed cookie so the callback can verify both.
     let msg = format!("{state}|{next}");
-    let sig = sign(app.cfg.session_secret.as_deref().unwrap(), &msg);
+    let cv = format!("{}.{}", hex::encode(&msg), g.sign(&format!("state|{msg}")));
     r.headers_mut().append(
         header::SET_COOKIE,
-        set_cookie(
-            &app,
-            "kk_state",
-            &format!("{}.{sig}", hex::encode(msg)),
-            600,
-        ),
+        g.set_cookie(g.state_cookie_name(), &cv, 600),
     );
     r
 }
@@ -161,41 +142,40 @@ async fn callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQ>,
 ) -> Response {
-    let (Some(cid), Some(cs), Some(secret)) = (
-        &app.cfg.oauth_client_id,
-        &app.cfg.oauth_client_secret,
-        &app.cfg.session_secret,
-    ) else {
+    let g = &app.guard;
+    let (Some(cid), Some(cs)) = (&app.cfg.oauth_client_id, &app.cfg.oauth_client_secret) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "sign-in not configured").into_response();
     };
     let Some(next) = (|| {
-        let (hexmsg, sig) = cookie(&headers, "kk_state")?.rsplit_once('.')?;
+        let (hexmsg, sig) = security::cookie(&headers, g.state_cookie_name())?.rsplit_once('.')?;
         let msg = String::from_utf8(hex::decode(hexmsg).ok()?).ok()?;
         let (state, next) = msg.split_once('|')?;
-        (verify(secret, &msg, sig) && state == q.state).then(|| next.to_string())
+        (g.verify(&format!("state|{msg}"), sig) && state == q.state).then(|| next.to_string())
     })() else {
         return (StatusCode::BAD_REQUEST, "bad state").into_response();
     };
-    let res: Result<String> = async {
+    let res: Result<(String, i64)> = async {
         let v: serde_json::Value = app
             .http
             .post("https://github.com/login/oauth/access_token")
             .header("Accept", "application/json")
-            .json(&serde_json::json!({"client_id": cid, "client_secret": cs, "code": q.code}))
+            .json(&serde_json::json!({"client_id": cid, "client_secret": cs, "code": q.code, "redirect_uri": format!("{}/callback", app.cfg.base_url)}))
             .send()
             .await?
             .json()
             .await?;
-        let Some(tok) = v["access_token"].as_str() else {
-            bail!("no access token")
-        };
-        Client::oauth_login(&app.http, tok).await
+        let Some(tok) = v["access_token"].as_str() else { bail!("no access token") };
+        Client::oauth_user(&app.http, tok).await
     }
     .await;
-    let login = match res {
-        Ok(l) if l.eq_ignore_ascii_case(&app.cfg.owner) => l,
-        Ok(l) => {
-            tracing::warn!("sign-in rejected for {l}");
+    let (login, id) = match res {
+        // Identity is pinned by immutable numeric id, not by (renameable) login.
+        Ok((l, id)) if id == g.owner_id => (l, id),
+        Ok((l, id)) => {
+            tracing::warn!(
+                "sign-in rejected for {l} (id {id}) from {}",
+                security::client_ip(&headers)
+            );
             return (StatusCode::FORBIDDEN, "this account is not allowed").into_response();
         }
         Err(e) => {
@@ -203,26 +183,24 @@ async fn callback(
             return (StatusCode::BAD_GATEWAY, "GitHub sign-in failed").into_response();
         }
     };
-    let exp = chrono::Utc::now().timestamp() + 3600;
-    let msg = format!("{login}.{exp}");
+    let cv = g.issue_session(&login, id, chrono::Utc::now().timestamp());
     let mut r = Redirect::to(&next).into_response();
     r.headers_mut().append(
         header::SET_COOKIE,
-        set_cookie(
-            &app,
-            "kk_session",
-            &format!("{msg}.{}", sign(secret, &msg)),
-            3600,
-        ),
+        g.set_cookie(g.session_cookie_name(), &cv, security::SESSION_TTL_SECS),
     );
-    r.headers_mut()
-        .append(header::SET_COOKIE, set_cookie(&app, "kk_state", "", 0));
+    r.headers_mut().append(
+        header::SET_COOKIE,
+        g.set_cookie(g.state_cookie_name(), "", 0),
+    );
     r
 }
 
+/// Only *open* recommendations with an unused, unexpired token are actionable.
 async fn lookup(app: &App, token: &str) -> Option<(i64, String, String)> {
     sqlx::query_as(
-        "SELECT rec_id, repo, action FROM action_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at > now()",
+        "SELECT t.rec_id, t.repo, t.action FROM action_tokens t JOIN recommendations r ON r.id = t.rec_id
+         WHERE t.token_hash=$1 AND t.used_at IS NULL AND t.expires_at > now() AND r.status='open'",
     )
     .bind(db::hash_token(token))
     .fetch_optional(&app.pool)
@@ -233,7 +211,7 @@ async fn lookup(app: &App, token: &str) -> Option<(i64, String, String)> {
 
 async fn confirm(
     State(app): State<Arc<App>>,
-    headers: HeaderMap,
+    Extension(sess): Extension<Session>,
     Path(token): Path<String>,
 ) -> Response {
     if !valid_token(&token) {
@@ -246,42 +224,57 @@ async fn confirm(
         )
         .into_response();
     };
-    if session_login(&app, &headers).is_none() {
-        return Redirect::to(&format!("/login?next=/a/{token}")).into_response();
-    }
     let verb = match action.as_str() {
         "archive" => "Archive (make read-only on GitHub; reversible from repo settings)",
-        "disable_actions" => "Turn off GitHub Actions (no more CI runs; re-enable in repo settings)",
+        "disable_actions" => {
+            "Turn off GitHub Actions (no more CI runs; re-enable in repo settings)"
+        }
+        "test_ping" | "test_archive" | "test_disable_actions" | "test_fail" => {
+            "SELF-TEST (nothing real changes): run the sandbox action on"
+        }
         _ => "Keep as-is: no change to the repo, and stop flagging this suggestion for",
     };
     page(
         "Confirm",
         &format!(
-            "<p>{verb} <b>{r}</b>?</p><form method=post><button style=\"padding:8px 16px\">Yes, do it</button></form>",
-            r = esc(&repo)
+            "<p>Signed in as <b>{who}</b>.</p><p>{verb} <b>{r}</b>?</p>\
+             <form method=post><input type=hidden name=csrf value=\"{csrf}\"><button>Yes, do it</button></form>",
+            who = esc(&sess.login),
+            r = esc(&repo),
+            csrf = esc(&sess.csrf)
         ),
     )
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct ExecForm {
+    csrf: String,
+}
+
 async fn execute(
     State(app): State<Arc<App>>,
+    Extension(sess): Extension<Session>,
     headers: HeaderMap,
     Path(token): Path<String>,
+    Form(f): Form<ExecForm>,
 ) -> Response {
     if !valid_token(&token) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let Some(actor) = session_login(&app, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
-    };
-    // Atomic claim: exactly one caller wins a token.
+    // Synchronizer token bound to this session (defence in depth on top of the origin check).
+    if !constant_eq(f.csrf.as_bytes(), sess.csrf.as_bytes()) {
+        return (StatusCode::FORBIDDEN, "bad csrf token").into_response();
+    }
+    // Atomic claim: exactly one caller wins a token, and only while the recommendation is still open.
     let claimed: Option<(i64, String, String)> = sqlx::query_as(
-        "UPDATE action_tokens SET used_at=now(), used_by=$2 WHERE token_hash=$1 AND used_at IS NULL AND expires_at > now()
-         RETURNING rec_id, repo, action",
+        "UPDATE action_tokens t SET used_at=now(), used_by=$2
+         FROM recommendations r
+         WHERE t.token_hash=$1 AND t.used_at IS NULL AND t.expires_at > now() AND r.id = t.rec_id AND r.status='open'
+         RETURNING t.rec_id, t.repo, t.action",
     )
     .bind(db::hash_token(&token))
-    .bind(&actor)
+    .bind(&sess.login)
     .fetch_optional(&app.pool)
     .await
     .unwrap_or(None);
@@ -292,16 +285,20 @@ async fn execute(
         )
         .into_response();
     };
-    // Invalidate the sibling buttons for the same recommendation: one decision per item.
-    let _ = sqlx::query("UPDATE action_tokens SET used_at=now(), used_by='superseded' WHERE rec_id=$1 AND used_at IS NULL")
-        .bind(rec_id)
-        .execute(&app.pool)
-        .await;
+    // One decision per item: invalidate the sibling buttons.
+    // (The sandbox item keeps its other buttons live so each can be tested.)
+    if repo != crate::jobs::SELFTEST_REPO {
+        let _ = sqlx::query("UPDATE action_tokens SET used_at=now(), used_by='superseded' WHERE rec_id=$1 AND used_at IS NULL")
+            .bind(rec_id)
+            .execute(&app.pool)
+            .await;
+    }
     let req = ActionRequest {
         rec_id,
         repo: repo.clone(),
         action,
-        actor,
+        actor: sess.login,
+        ip: security::client_ip(&headers),
     };
     let queued = match &app.nats {
         Some(js) => match js
@@ -317,7 +314,11 @@ async fn execute(
         // No NATS (or publish failed): run inline so the click is never silently lost.
         if let Err(e) = perform(&app, &req).await {
             tracing::error!("action failed: {e:#}");
-            return page("Failed", &format!("<p>{}</p>", esc(&format!("{e:#}")))).into_response();
+            return page(
+                "Failed",
+                "<p>The action failed. Check the service logs.</p>",
+            )
+            .into_response();
         }
         return page(
             "Done",
@@ -328,11 +329,15 @@ async fn execute(
     page(
         "Queued",
         &format!(
-            "<p>Request for <b>{}</b> queued; you'll see the result on GitHub shortly.</p>",
+            "<p>Request for <b>{}</b> queued; it will run in a moment.</p>",
             esc(&repo)
         ),
     )
     .into_response()
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// Do the thing and record it. The recommendation must exist and match the repo.
@@ -346,21 +351,34 @@ pub async fn perform(app: &App, req: &ActionRequest) -> Result<()> {
     if ok.is_none() {
         bail!("recommendation {} does not match {}", req.rec_id, req.repo);
     }
+    let sandbox = req.repo == crate::jobs::SELFTEST_REPO;
+    // Real actions never run on the sandbox item, and test actions never run on real repos.
+    if sandbox != req.action.starts_with("test_") && req.action != "dismiss" {
+        bail!("action {} not allowed on {}", req.action, req.repo);
+    }
     let res = match req.action.as_str() {
         "archive" => app.gh.archive_repo(&req.repo).await,
         "disable_actions" => app.gh.disable_actions(&req.repo).await,
+        "test_ping" | "test_archive" | "test_disable_actions" => {
+            tracing::info!("selftest {} ok (no GitHub call)", req.action);
+            Ok(())
+        }
+        "test_fail" => Err(anyhow::anyhow!("intentional self-test failure")),
         "dismiss" => Ok(()),
         other => Err(anyhow::anyhow!("unknown action {other}")),
     };
-    sqlx::query("INSERT INTO action_log (actor, action, repo, ok, detail) VALUES ($1,$2,$3,$4,$5)")
-        .bind(&req.actor)
-        .bind(&req.action)
-        .bind(&req.repo)
-        .bind(res.is_ok())
-        .bind(res.as_ref().err().map(|e| format!("{e:#}")))
-        .execute(&app.pool)
-        .await?;
-    if res.is_ok() {
+    sqlx::query(
+        "INSERT INTO action_log (actor, action, repo, ok, detail, ip) VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(&req.actor)
+    .bind(&req.action)
+    .bind(&req.repo)
+    .bind(res.is_ok())
+    .bind(res.as_ref().err().map(|e| format!("{e:#}")))
+    .bind(&req.ip)
+    .execute(&app.pool)
+    .await?;
+    if res.is_ok() && !sandbox {
         let status = if req.action == "dismiss" {
             "dismissed"
         } else {
