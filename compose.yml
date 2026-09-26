@@ -1,0 +1,43 @@
+# Local stack: postgres + nats + the web/worker. Run jobs on demand:
+#   docker compose run --rm knock-knock daily --force
+#   docker compose run --rm knock-knock usage
+# Copy .env.example to .env first.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: knock
+      POSTGRES_PASSWORD: knock
+      POSTGRES_DB: knock
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knock"]
+      interval: 5s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    command: ["-js", "-sd", "/data"]
+    volumes: [natsdata:/data]
+
+  knock-knock:
+    build: .
+    image: mbround18/knock-knock:dev
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://knock:knock@postgres:5432/knock
+      NATS_URL: nats://nats:4222
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/gh_app_key
+    secrets: [gh_app_key]
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_started }
+
+secrets:
+  gh_app_key:
+    file: ${GITHUB_APP_PRIVATE_KEY_PATH:-./app-private-key.pem}
+
+volumes:
+  pgdata:
+  natsdata:
