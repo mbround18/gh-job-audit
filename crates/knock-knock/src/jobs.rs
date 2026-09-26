@@ -185,6 +185,11 @@ async fn render_report(
                 _ => &[("dismiss", "Got it, stop flagging")],
             };
             for (a, label) in acts {
+                if matches!(*a, "archive" | "disable_actions")
+                    && !crate::security::destructive_enabled()
+                {
+                    continue;
+                }
                 let url = mint(cfg, pool, *id, repo, a).await?;
                 let color = if *a == "dismiss" {
                     "#6b7280"
@@ -757,9 +762,12 @@ pub async fn assigner(gh: Client, pool: PgPool, js: Js) -> Result<()> {
                 }
                 Err(e) => {
                     tracing::warn!("assign {}#{} failed: {e:#}", req.repo, req.number);
-                    let _ = m
-                        .ack_with(AckKind::Nak(Some(std::time::Duration::from_secs(60))))
-                        .await;
+                    let kind = if crate::security::is_permanent(&format!("{e:#}")) {
+                        AckKind::Term
+                    } else {
+                        AckKind::Nak(Some(std::time::Duration::from_secs(60)))
+                    };
+                    let _ = m.ack_with(kind).await;
                 }
             },
             Err(_) => {
