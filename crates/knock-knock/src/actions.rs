@@ -250,9 +250,9 @@ async fn confirm(
         return Redirect::to(&format!("/login?next=/a/{token}")).into_response();
     }
     let verb = match action.as_str() {
-        "archive" => "Archive",
-        "disable_actions" => "Disable GitHub Actions on",
-        _ => "Dismiss the recommendation for",
+        "archive" => "Archive (make read-only on GitHub; reversible from repo settings)",
+        "disable_actions" => "Turn off GitHub Actions (no more CI runs; re-enable in repo settings)",
+        _ => "Keep as-is: no change to the repo, and stop flagging this suggestion for",
     };
     page(
         "Confirm",

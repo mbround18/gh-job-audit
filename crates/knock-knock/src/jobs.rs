@@ -160,12 +160,12 @@ async fn render_report(
         if can_act {
             let acts: &[(&str, &str)] = match kind.as_str() {
                 "archive" => &[
-                    ("archive", "Archive"),
-                    ("disable_actions", "Disable CI"),
-                    ("dismiss", "Dismiss"),
+                    ("archive", "Archive repo"),
+                    ("disable_actions", "Turn off Actions"),
+                    ("dismiss", "Keep as-is"),
                 ],
-                "disable_actions" => &[("disable_actions", "Disable CI"), ("dismiss", "Dismiss")],
-                _ => &[("dismiss", "Dismiss")],
+                "disable_actions" => &[("disable_actions", "Turn off Actions"), ("dismiss", "Keep as-is")],
+                _ => &[("dismiss", "Got it, stop flagging")],
             };
             for (a, label) in acts {
                 let url = mint(cfg, pool, *id, repo, a).await?;
