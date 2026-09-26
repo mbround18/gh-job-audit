@@ -356,6 +356,11 @@ pub async fn perform(app: &App, req: &ActionRequest) -> Result<()> {
     if sandbox != req.action.starts_with("test_") && req.action != "dismiss" {
         bail!("action {} not allowed on {}", req.action, req.repo);
     }
+    if matches!(req.action.as_str(), "archive" | "disable_actions")
+        && !crate::security::destructive_enabled()
+    {
+        bail!("refusing to act: destructive actions are disabled (DESTRUCTIVE_ACTIONS=false)");
+    }
     let res = match req.action.as_str() {
         "archive" => app.gh.archive_repo(&req.repo).await,
         "disable_actions" => app.gh.disable_actions(&req.repo).await,
@@ -436,7 +441,13 @@ pub async fn worker(app: Arc<App>) -> Result<()> {
                 }
                 Err(e) => {
                     tracing::error!("action {req:?} failed: {e:#}");
-                    let _ = m.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                    // Permanent errors (forbidden, missing, refused, unprocessable) will not heal on retry.
+                    let kind = if crate::security::is_permanent(&format!("{e:#}")) {
+                        async_nats::jetstream::AckKind::Term
+                    } else {
+                        async_nats::jetstream::AckKind::Nak(None)
+                    };
+                    let _ = m.ack_with(kind).await;
                 }
             },
             Err(e) => {

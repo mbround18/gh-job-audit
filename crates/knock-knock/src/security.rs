@@ -8,7 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::{
     collections::HashMap,
@@ -148,13 +148,32 @@ pub fn cookie<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .find_map(|c| c.trim().strip_prefix(prefix.as_str()))
 }
 
+/// Rate-limit / log key. `CF-Connecting-IP` is set by Cloudflare (which overwrites any client value);
+/// otherwise take the *last* X-Forwarded-For hop, which the nearest trusted proxy appended. The first
+/// hop is client-controlled and would let anyone dodge the limiter by rotating a fake value.
 fn client_key(h: &HeaderMap) -> String {
-    ["cf-connecting-ip", "x-forwarded-for"]
-        .iter()
-        .find_map(|n| h.get(*n).and_then(|v| v.to_str().ok()))
-        .and_then(|v| v.split(',').next())
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    get("cf-connecting-ip")
+        .or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()))
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 64)
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// Feature flag for the buttons that change repos (archive, disable Actions). Default on; set
+/// `DESTRUCTIVE_ACTIONS=false` to make the service effectively read-only even with a write-capable App.
+pub fn destructive_enabled() -> bool {
+    !matches!(
+        std::env::var("DESTRUCTIVE_ACTIONS").ok().as_deref(),
+        Some("false" | "0" | "no" | "off")
+    )
+}
+
+/// Errors from GitHub that retrying cannot fix.
+pub fn is_permanent(err: &str) -> bool {
+    ["403", "404", "410", "422", "refusing to act", "not owned"]
+        .iter()
+        .any(|s| err.contains(s))
 }
 
 pub fn client_ip(h: &HeaderMap) -> String {
@@ -281,13 +300,28 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 fn _body(_: Body) {}
 
 #[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    #[test]
+    fn spoofed_first_hop_is_ignored() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, 9.9.9.9".parse().unwrap());
+        assert_eq!(client_key(&h), "9.9.9.9");
+        h.insert("cf-connecting-ip", "5.5.5.5".parse().unwrap());
+        assert_eq!(client_key(&h), "5.5.5.5");
+    }
+    #[test]
+    fn permanent_errors_detected() {
+        assert!(is_permanent("archive o/r: 403 Forbidden"));
+        assert!(!is_permanent("GET /x: rate limited"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::middleware::from_fn_with_state as mw;
-    use axum::{
-        Router,
-        routing::{get, post},
-    };
+    use axum::{Router, routing::get};
     use tower::ServiceExt;
 
     fn guard() -> Arc<Guard> {
