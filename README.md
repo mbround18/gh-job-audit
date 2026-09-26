@@ -1,6 +1,6 @@
 # gh-audit
 
-Rust workspace for watching a GitHub account.
+Rust workspace for watching a GitHub account. Images are published as `mbround18/gh-job-<name>:<version>` (this service: `gh-job-audit`).
 
 | crate | what |
 | --- | --- |

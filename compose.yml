@@ -22,7 +22,7 @@ services:
 
   knock-knock:
     build: .
-    image: mbround18/knock-knock:dev
+    image: mbround18/gh-job-audit:dev
     env_file: .env
     environment:
       DATABASE_URL: postgres://knock:knock@postgres:5432/knock
