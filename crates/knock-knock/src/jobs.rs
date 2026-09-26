@@ -183,12 +183,26 @@ async fn render_report(
         }
         html += "</td></tr>";
     }
-    html += "</table><p><small>Buttons are single-use, expire in ";
-    html += &format!(
-        "{}h and require GitHub sign-in as {}.</small></p></div>",
-        cfg.action_ttl_hours,
-        esc(&cfg.owner)
-    );
+    let legend: [(&str, &str); 3] = [
+        ("Archive repo", "makes the repo read-only on GitHub. Reversible any time in the repo's settings."),
+        ("Turn off Actions", "stops all workflow runs on the repo. Re-enable in Settings > Actions."),
+        ("Keep as-is", "changes nothing on GitHub and stops flagging that suggestion."),
+    ];
+    html += "</table>";
+    if can_act {
+        html += "<h4 style=\"margin-bottom:4px\">What the buttons do</h4><ul style=\"margin-top:0;font-size:13px\">";
+        text += "\nWhat the buttons do:\n";
+        for (name, what) in legend {
+            html += &format!("<li><b>{name}</b>: {what}</li>");
+            text += &format!("  {name}: {what}\n");
+        }
+        html += &format!(
+            "</ul><p><small>Buttons are single-use, expire in {}h and require GitHub sign-in as {}. Nothing changes until you confirm on the next page.</small></p>",
+            cfg.action_ttl_hours,
+            esc(&cfg.owner)
+        );
+    }
+    html += "</div>";
     Ok((html, text))
 }
 
