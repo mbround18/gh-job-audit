@@ -13,8 +13,7 @@ pub fn hash_token(t: &str) -> String {
 }
 
 pub fn new_token() -> String {
-    use rand::RngCore;
     let mut b = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::fill(&mut b);
     hex::encode(b)
 }

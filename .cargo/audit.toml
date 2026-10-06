@@ -1,0 +1,4 @@
+[advisories]
+# rsa (Marvin attack, no fix) is only pulled in by sqlx-macros-core's unused mysql driver; it is not
+# in the compiled dependency graph (`cargo tree -i rsa` is empty).
+ignore = ["RUSTSEC-2023-0071"]

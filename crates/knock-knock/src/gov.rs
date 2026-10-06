@@ -43,6 +43,9 @@ pub async fn run(
 ) -> Result<()> {
     let lock = 0x6b6b10 + job as i64;
     with_lock(pool, lock, || async {
+        if matches!(job, GovJob::Rollup) {
+            prune(pool).await?;
+        }
         match job {
             GovJob::Security => security(cfg, gh, pool, nats).await,
             GovJob::Hygiene => hygiene(cfg, gh, pool, nats).await,
@@ -57,6 +60,23 @@ pub async fn run(
         }
     })
     .await
+}
+
+/// Retention: keep the tables that grow forever bounded. Runs with the weekly rollup.
+async fn prune(pool: &PgPool) -> Result<()> {
+    for q in [
+        "DELETE FROM gov_metrics WHERE at < now() - interval '400 days'",
+        "DELETE FROM action_log WHERE at < now() - interval '365 days'",
+        "DELETE FROM action_tokens WHERE expires_at < now() - interval '30 days'",
+        "DELETE FROM mail_log WHERE sent_at < now() - interval '180 days'",
+        "DELETE FROM tracked_items WHERE NOT unassigned AND NOT stale AND last_seen_at < now() - interval '90 days'",
+    ] {
+        let n = sqlx::query(q).execute(pool).await?.rows_affected();
+        if n > 0 {
+            tracing::info!("prune: {n} rows ({q})");
+        }
+    }
+    Ok(())
 }
 
 // ---------- plumbing ----------
